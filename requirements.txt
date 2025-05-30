@@ -1,0 +1,7 @@
+atproto
+dotenv
+requests
+argparse
+urllib3
+python-dateutil
+typing-extensions
