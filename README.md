@@ -33,7 +33,6 @@ This project automates posting random songs from PopHits.org to Bluesky.
     ```
     POPHITS_BLUESKY_USERNAME=<your_bluesky_username>
     POPHITS_BLUESKY_PASSWORD=<your_bluesky_password>
-    LASTFM_API_KEY=<your_lastfm_api_key> # Required for bluesky_song_poster.py
     ```
 
 2.  Run the script:

@@ -1,17 +1,14 @@
 import requests
 import argparse
 import random
-from atproto import Client, models
+from atproto import Client
 import os
 from dotenv import load_dotenv
-import urllib.parse
 from atproto import models as atproto_models
-import unicodedata
 from datetime import datetime
+import re
 
 load_dotenv()
-
-LASTFM_API_KEY = os.environ.get("LASTFM_API_KEY") # Assumes you have the API key in .env
 
 POPHITS_BLUESKY_USERNAME = os.environ.get('POPHITS_BLUESKY_USERNAME')
 POPHITS_BLUESKY_PASSWORD = os.environ.get('POPHITS_BLUESKY_PASSWORD')
@@ -22,62 +19,6 @@ try:
 except Exception as e:
     print(f"Error logging in to Bluesky: {e}")
     client = None
-
-def get_artist_image(artist_name):
-    """
-    Searches Last.fm for an artist image.
-    """
-    url = f"http://ws.audioscrobbler.com/2.0/?method=artist.getinfo&artist={artist_name}&api_key={LASTFM_API_KEY}&format=json"
-    try:
-        response = requests.get(url)
-        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-        data = response.json()
-        images = data['artist']['image']
-
-        def is_placeholder(url):
-            return "2a96cbd8b46e442fc41c2b86b821562f.png" in url or "noimage" in url
-
-        # Find the largest non-placeholder image
-        image_url = None
-        for image in reversed(images):
-            url = image['#text']
-            if not is_placeholder(url):
-                image_url = url
-                break
-
-        return image_url
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching image from Last.fm: {e}")
-        return None
-    except KeyError:
-        print(f"No image found for artist: {artist_name}")
-        return None
-
-import io
-import requests
-from atproto import models
-from atproto import Client
-
-# Placeholder function for uploading the image to Bluesky
-def upload_image(image_url, client):
-    """
-    Uploads the image to Bluesky's image service and returns the image URI.
-    """
-    try:
-        response = requests.get(image_url, stream=True)
-        response.raise_for_status()
-        image_data = io.BytesIO(response.content)
-
-        # Upload the image to Bluesky
-        upload = client.upload_blob(image_data)
-        return upload.blob
-    except requests.exceptions.RequestException as e:
-        print(f"Error uploading image: {e}")
-        return None
-
-POPHITS_BLUESKY_USERNAME = os.environ.get('POPHITS_BLUESKY_USERNAME')
-POPHITS_BLUESKY_PASSWORD = os.environ.get('POPHITS_BLUESKY_PASSWORD')
-
 
 # Define tag rules
 def tag_song(song):
@@ -136,7 +77,7 @@ template_map = {
     ],
     "longevity": [
         '"{title}" by {artist} stayed on the charts for {weeks_on_chart} weeks — staying power! {emoji}',
-        '{weeks_on_chart} weeks on the Hot 100 — "{title}" really stuck around {emoji}',
+        '{weeks_on_chart} weeks on the Hot 100 — {artist}\'s "{title}" really stuck around {emoji}',
     ],
     "short_run": [
         '"{title}" had a quick run — just {weeks_on_chart} weeks on the charts. Blink and you missed it! {emoji}',
@@ -144,7 +85,7 @@ template_map = {
     ],
     "timeless": [
         'Timeless: "{title}" by {artist} still holds up decades after its {year} release {emoji}',
-        '"{title}" is over 50 years old, but still a fan favorite {emoji}',
+        '"{title}" by {artist} is over 50 years old, but still a fan favorite {emoji}',
     ],
     "sixties": [
         '"{title}" captured the spirit of the 60s when it hit #{peak_rank} in {year} {emoji}',
@@ -174,7 +115,7 @@ fallback_templates = [
 # Hashtag generator
 def generate_hashtags(song):
     base_tags = ["#pophits", "#Hot100", "#Billboard"]
-    artist_tag = f"#{song['artist'].replace(' ', '')}"
+    artist_tag = f"#" + re.sub(r'[^a-zA-Z0-9]', '', song['artist'])
     return " ".join(base_tags + [artist_tag])
 
 # Generate the final post
@@ -182,27 +123,38 @@ def generate_post(song):
     tags = tag_song(song)
     random.shuffle(tags)  # Add variety
     template_used = None
-
+    text = ""
+    available_length = 280 - len(f" Check it out at https://pophits.org/songs/{song['slug']}!\\n#pophits #Hot100 #Billboard")
     for tag in tags:
         templates = template_map.get(tag)
         if templates:
             emoji = emoji_map.get(tag, "")
             template = random.choice(templates)
-            template_used = tag
-            break
+            new_text = template.format(
+                title=song["title"],
+                artist=song["artist"],
+                year=song["year"],
+                peak_rank=song["peak_rank"],
+                weeks_on_chart=song["weeks_on_chart"],
+                emoji=emoji
+            )
+            if len(text) + len(new_text) <= available_length:
+                if new_text not in text:
+                    text = new_text
+                    template_used = tag
+            else:
+                break
 
     if not template_used:
         template = random.choice(fallback_templates)
         emoji = ""
-
-    text = template.format(
-        title=song["title"],
-        artist=song["artist"],
-        year=song["year"],
-        peak_rank=song["peak_rank"],
-        weeks_on_chart=song["weeks_on_chart"],
-        emoji=emoji
-    )
+        text = template.format(
+            title=song["title"],
+            artist=song["artist"],
+            year=song["year"],
+            peak_rank=song["peak_rank"],
+            weeks_on_chart=weeks_on_chart,
+        )
 
     # Ensure artist, year, and chart performance are always included
     if "{artist}" not in template and "{title}" not in template:
@@ -215,8 +167,10 @@ def generate_post(song):
     link = f"https://pophits.org/songs/{song['slug']}"
     hashtags = generate_hashtags(song)
 
-    return f"{text} Check it out at {link}!\n{hashtags}"
-
+    if len(text) + len(f" Check it out at {link}!\n{hashtags}") <= 300:
+        return f"{text} Check it out at {link}!\n{hashtags}"
+    else:
+        return text
 
 def get_random_song():
     url = "https://pophits.org/api/songs/"
@@ -226,6 +180,7 @@ def get_random_song():
         data = response.json()
         if isinstance(data, dict) and 'results' in data and isinstance(data['results'], list) and len(data['results']) > 0:
             random_song = random.choice(data['results'])
+            song = None
             song_title = random_song['title']
             artist_name = random_song['artist']
             if isinstance(artist_name, str):
@@ -235,15 +190,20 @@ def get_random_song():
             year = random_song['year']
             peak_rank = random_song['peak_rank']
             slug = random_song['slug']
-            weeks_on_chart = random_song['weeks_on_chart']
-            song = {
-                "title": song_title,
-                "artist": artist_name,
-                "year": year,
-                "peak_rank": peak_rank,
-                "weeks_on_chart": weeks_on_chart,
-                "slug": slug
-            }
+            weeks_on_chart = 0
+            if 'weeks_on_chart' in random_song:
+                weeks_on_chart = random_song['weeks_on_chart']
+                song = {
+                    "title": song_title,
+                    "artist": artist_name,
+                    "year": year,
+                    "peak_rank": peak_rank,
+                    "weeks_on_chart": weeks_on_chart,
+                    "slug": slug
+                }
+            else:
+                print("Error: weeks_on_chart not found in the API response.")
+                return None
             return song
         else:
             print("Error: No songs found in the API response.")
@@ -255,9 +215,9 @@ def get_random_song():
         print(f"Error: Could not parse song information from the API response: {e}")
         return None
 
-import re
+from atproto import models as atproto_models
 
-def create_bluesky_post(username, password, post_text, url, byte_start, byte_end, image_url=None, client=None):
+def create_bluesky_post(username, password, post_text, url, byte_start, byte_end, client=None):
     try:
         facets = []
 
@@ -285,18 +245,9 @@ def create_bluesky_post(username, password, post_text, url, byte_start, byte_end
                     features=[atproto_models.AppBskyRichtextFacet.Link(uri=f"https://bsky.app/search?q={hashtag[1:]}")],
                     index=atproto_models.AppBskyRichtextFacet.ByteSlice(byteStart=hashtag_byte_start, byteEnd=hashtag_byte_end),
                 )
-            )
+        )
 
-        if image_url:
-            blob = upload_image(image_url, client)
-            # Assuming you have a method to add an image to the post
-            # This is a placeholder, replace with your actual image embedding code
-            print(f"Adding image to post: {blob}")
-            # Example:
-            embed = {'$type': 'app.bsky.embed.images', 'images': [{'image': blob, 'alt': 'Artist Image'}]}
-            client.post(text=post_text, facets=facets, embed=embed)
-        else:
-            client.post(text=post_text, facets=facets)
+        client.post(text=post_text, facets=facets)
         print("✅ Bluesky post created successfully!")
     except Exception as e:
         print(f"🚫 Error: Failed to create Bluesky post: {e}")
@@ -323,14 +274,10 @@ def main():
         byte_start = len(post_text[:url_start].encode('utf-8'))
         byte_end = len(post_text[:url_end].encode('utf-8'))
         
-        # Get artist image
-        artist_name = song['artist']
-        image_url = get_artist_image(artist_name)
-        
         client = Client()
         client.login(username, password)
 
-        create_bluesky_post(username, password, post_text, url, byte_start, byte_end, image_url, client)
+        create_bluesky_post(username, password, post_text, url, byte_start, byte_end, client)
 
 if __name__ == "__main__":
     main()
