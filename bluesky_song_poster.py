@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 from atproto import models as atproto_models
 from datetime import datetime
 import re
+import io
+from PIL import Image
 
 load_dotenv()
 
@@ -166,44 +168,100 @@ def generate_post(song):
 
     link = f"https://pophits.org/songs/{song['slug']}"
     hashtags = generate_hashtags(song)
+    domain = "pophits.org"
 
-    if len(text) + len(f" Check it out at {link}!\n{hashtags}") <= 300:
-        return f"{text} Check it out at {link}!\n{hashtags}"
+    if len(text) + len(f" Check it out at {domain}!\n{hashtags}") <= 300:
+        return f"{text} Check it out at {domain}!\n{hashtags}"
     else:
         return text
 
 def get_random_song():
+    def get_musicbrainz_release_id(artist, track):
+        """
+        Searches MusicBrainz API for a single release MBID.
+        """
+        base_url = "https://musicbrainz.org/ws/2/release/"
+        query = f'recording:"{track}" AND artist:"{artist}" AND primarytype:single'
+        url = f"{base_url}?query={query}&fmt=json"
+
+        headers = {
+            'User-Agent': 'PopHits Bluesky Automation Script (pophits.org)'
+        }
+
+        try:
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+
+            if data and 'releases' in data and len(data['releases']) > 0:
+                return data['releases'][0]['id']
+            else:
+                return None
+        except requests.exceptions.RequestException as e:
+            print(f"Error querying MusicBrainz: {e}")
+            return None
+        finally:
+            print(f"MusicBrainz query for {artist}, {track} returned MBID: {data['releases'][0]['id'] if data and 'releases' in data and len(data['releases']) > 0 else None}")
+
+    def get_cover_art_url(mbid):
+        """
+        Fetches cover art URL from Cover Art Archive.
+        """
+        base_url = "https://coverartarchive.org/release/"
+        url = f"{base_url}{mbid}/front"
+        print(f"Querying Cover Art Archive with MBID: {mbid}")
+
+        try:
+            response = requests.get(url)
+            if response.status_code == 200:
+                return url
+            else:
+                return None
+        except requests.exceptions.RequestException as e:
+            print(f"Error querying Cover Art Archive: {e}")
+            return None
+        finally:
+            print(f"Cover Art Archive query for MBID {mbid} returned status code: {response.status_code if 'response' in locals() else 'No Response'}")
+
     url = "https://pophits.org/api/songs/"
+    page = 1
+    all_songs = []
+    max_pages = 5  # Limit to 5 pages
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        if isinstance(data, dict) and 'results' in data and isinstance(data['results'], list) and len(data['results']) > 0:
-            random_song = random.choice(data['results'])
-            song = None
+        while page <= max_pages:
+            response = requests.get(f"{url}?page={page}")
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, dict) and 'results' in data and isinstance(data['results'], list) and len(data['results']) > 0:
+                all_songs.extend(data['results'])
+                page += 1
+            else:
+                break
+
+        if all_songs:
+            random_song = random.choice(all_songs)
             song_title = random_song['title']
             artist_name = random_song['artist']
-            if isinstance(artist_name, str):
-                artist_name = artist_name
-            else:
-                artist_name = random_song['artist']['name']
+            artist_name = artist_name if isinstance(artist_name, str) else random_song['artist']['name']
             year = random_song['year']
             peak_rank = random_song['peak_rank']
             slug = random_song['slug']
-            weeks_on_chart = 0
-            if 'weeks_on_chart' in random_song:
-                weeks_on_chart = random_song['weeks_on_chart']
-                song = {
-                    "title": song_title,
-                    "artist": artist_name,
-                    "year": year,
-                    "peak_rank": peak_rank,
-                    "weeks_on_chart": weeks_on_chart,
-                    "slug": slug
-                }
-            else:
-                print("Error: weeks_on_chart not found in the API response.")
-                return None
+            weeks_on_chart = random_song.get('weeks_on_chart', 0)
+
+            mbid = get_musicbrainz_release_id(artist_name, song_title)
+            cover_art_url = None
+            if mbid:
+                cover_art_url = get_cover_art_url(mbid)
+
+            song = {
+                "title": song_title,
+                "artist": artist_name,
+                "year": year,
+                "peak_rank": peak_rank,
+                "weeks_on_chart": weeks_on_chart,
+                "slug": slug,
+                "cover_art_url": cover_art_url
+            }
             return song
         else:
             print("Error: No songs found in the API response.")
@@ -217,11 +275,15 @@ def get_random_song():
 
 from atproto import models as atproto_models
 
-def create_bluesky_post(username, password, post_text, url, byte_start, byte_end, client=None):
+def create_bluesky_post(username, password, song, post_text, url, client=None):
     try:
         facets = []
 
         # Add link for the song URL
+        domain = "pophits.org"
+        url_start = post_text.find(domain)
+        byte_start = len(post_text[:url_start].encode('utf-8'))
+        byte_end = byte_start + len(domain.encode('utf-8'))
         facets.append(
             atproto_models.AppBskyRichtextFacet.Main(
                 features=[atproto_models.AppBskyRichtextFacet.Link(uri=url)],
@@ -245,9 +307,35 @@ def create_bluesky_post(username, password, post_text, url, byte_start, byte_end
                     features=[atproto_models.AppBskyRichtextFacet.Link(uri=f"https://bsky.app/search?q={hashtag[1:]}")],
                     index=atproto_models.AppBskyRichtextFacet.ByteSlice(byteStart=hashtag_byte_start, byteEnd=hashtag_byte_end),
                 )
-        )
+            )
+        
+        if song['cover_art_url']:
+            image_url = song['cover_art_url']
+            image_response = requests.get(image_url, stream=True)
+            image_response.raise_for_status()
 
-        client.post(text=post_text, facets=facets)
+            image = Image.open(io.BytesIO(image_response.content))
+            image_bytes = io.BytesIO()
+            image.save(image_bytes, format='JPEG')
+            image_bytes.seek(0)
+
+            upload = client.upload_blob(image_bytes.read())
+
+            client.post(
+                text=post_text,
+                embed=atproto_models.AppBskyEmbedImages.Main(
+                    images=[
+                        atproto_models.AppBskyEmbedImages.Image(
+                            alt="Cover Art",
+                            image=upload.blob,
+                        ),
+                    ],
+                ),
+                facets=facets,
+            )
+        else:
+            client.post(text=post_text, facets=facets)
+
         print("✅ Bluesky post created successfully!")
     except Exception as e:
         print(f"🚫 Error: Failed to create Bluesky post: {e}")
@@ -267,17 +355,11 @@ def main():
     if song:
         post_text = generate_post(song)
         url = f"https://pophits.org/songs/{song['slug']}"
-        url_start = post_text.find(url)
-        url_end = url_start + len(url)
 
-        # Convert character indices to byte indices
-        byte_start = len(post_text[:url_start].encode('utf-8'))
-        byte_end = len(post_text[:url_end].encode('utf-8'))
-        
         client = Client()
         client.login(username, password)
 
-        create_bluesky_post(username, password, post_text, url, byte_start, byte_end, client)
+        create_bluesky_post(username, password, song, post_text, url, client)
 
 if __name__ == "__main__":
     main()
