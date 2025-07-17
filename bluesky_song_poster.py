@@ -10,14 +10,13 @@ import re
 import io
 from PIL import Image
 
-# NEW: import the rich templates
 from templates import TEMPLATES as template_map, FALLBACK_TEMPLATES as fallback_templates
 
 load_dotenv()
 
 POPHITS_BLUESKY_USERNAME = os.environ.get('POPHITS_BLUESKY_USERNAME')
 POPHITS_BLUESKY_PASSWORD = os.environ.get('POPHITS_BLUESKY_PASSWORD')
-
+YOUTUBE_API_KEY = os.environ.get('YOUTUBE_API_KEY')
 
 def tag_song(song):
     tags = []
@@ -67,7 +66,7 @@ def generate_hashtags(song):
 
 def generate_post(song):
     tags = tag_song(song)
-    random.shuffle(tags)  # Add variety
+    random.shuffle(tags)
     template_used = None
     text = ""
     available_length = 280 - len(f" Check it out at https://pophits.org/songs/{song['slug']}!\\n#pophits #Hot100 #Billboard")
@@ -107,13 +106,16 @@ def generate_post(song):
         chosen_template = template
 
     # Ensure artist, year, and chart performance are always included
-    # (This is likely not needed now, but kept for robustness)
     if "{artist}" not in chosen_template and "{title}" not in chosen_template:
         text = f'"{song["title"]}" by {song["artist"]} {text}'
     if "{year}" not in chosen_template:
         text = f'{text} Released in {song["year"]}'
     if "{peak_rank}" not in chosen_template:
         text = f'{text} Peaked at #{song["peak_rank"]} on the charts'
+
+    # If there's a YouTube link, add it after the main sentence but before hashtags
+    if song.get("youtube_url"):
+        text += f"\n▶️ Watch/listen: {song['youtube_url']}"
 
     link = f"https://pophits.org/songs/{song['slug']}"
     hashtags = generate_hashtags(song)
@@ -124,10 +126,42 @@ def generate_post(song):
     else:
         return text
 
-# --- Song and Artwork Fetching ---
+def get_youtube_song_url(title, artist, api_key):
+    """Return a YouTube URL for the most likely official song video, or None if not found or API errored."""
+    try:
+        query = f'{artist} {title} official audio OR music video'
+        url = "https://www.googleapis.com/youtube/v3/search"
+        params = {
+            'part': 'snippet',
+            'q': query,
+            'type': 'video',
+            'key': api_key,
+            'maxResults': 5,
+            'videoCategoryId': '10',  # Music
+        }
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        results = data.get('items', [])
+        for item in results:
+            vid_title = item['snippet']['title'].lower()
+            channel = item['snippet']['channelTitle'].lower()
+            # Best: both song and artist in video title
+            if artist.lower() in vid_title and title.lower() in vid_title:
+                return f"https://www.youtube.com/watch?v={item['id']['videoId']}"
+            # Strong: artist in channel name and song in title
+            if artist.lower() in channel and title.lower() in vid_title:
+                return f"https://www.youtube.com/watch?v={item['id']['videoId']}"
+        if results:
+            # Fallback to first result
+            return f"https://www.youtube.com/watch?v={results[0]['id']['videoId']}"
+        return None
+    except Exception as e:
+        print(f"Error fetching YouTube video: {e}")
+        return None
 
 def get_random_song():
-    """Fetch a random song from the PopHits API and try to pull cover art via MusicBrainz/Cover Art Archive."""
+    """Fetch a random song from PopHits API; get cover art or, as fallback, a YouTube video link."""
     def get_musicbrainz_release_id(artist, track):
         base_url = "https://musicbrainz.org/ws/2/release/"
         query = f'recording:"{track}" AND artist:"{artist}" AND primarytype:single'
@@ -166,7 +200,6 @@ def get_random_song():
                 f"{response.status_code if 'response' in locals() else 'No Response'}"
             )
 
-    # Fetch a truly random song!
     url = "https://pophits.org/api/songs/random-song/"
     try:
         response = requests.get(url)
@@ -185,6 +218,10 @@ def get_random_song():
         if mbid:
             cover_art_url = get_cover_art_url(mbid)
 
+        youtube_url = None
+        if not cover_art_url and YOUTUBE_API_KEY:
+            youtube_url = get_youtube_song_url(song_title, artist_name, YOUTUBE_API_KEY)
+
         song = {
             "title": song_title,
             "artist": artist_name,
@@ -192,7 +229,8 @@ def get_random_song():
             "peak_rank": peak_rank,
             "weeks_on_chart": weeks_on_chart,
             "slug": slug,
-            "cover_art_url": cover_art_url
+            "cover_art_url": cover_art_url,
+            "youtube_url": youtube_url,
         }
         return song
     except requests.exceptions.RequestException as e:
@@ -201,8 +239,6 @@ def get_random_song():
     except (KeyError, TypeError) as e:
         print(f"Error parsing random song API response: {e}")
         return None
-
-# --- Posting ---
 
 def create_bluesky_post(username, password, song, post_text, url, client=None, dry_run=False):
     try:
@@ -245,7 +281,7 @@ def create_bluesky_post(username, password, song, post_text, url, client=None, d
                 )
             )
         
-        if song['cover_art_url']:
+        if song.get('cover_art_url'):
             image_url = song['cover_art_url']
             image_response = requests.get(image_url, stream=True)
             image_response.raise_for_status()
@@ -272,8 +308,6 @@ def create_bluesky_post(username, password, song, post_text, url, client=None, d
         print("✅ Bluesky post created successfully!")
     except Exception as e:
         print(f"🚫 Error: Failed to create Bluesky post: {e}")
-
-# --- Main ---
 
 def main():
     parser = argparse.ArgumentParser(description='Post a random song from pophits.org to Bluesky.')
