@@ -113,55 +113,17 @@ def generate_post(song):
     if "{peak_rank}" not in chosen_template:
         text = f'{text} Peaked at #{song["peak_rank"]} on the charts'
 
-    # If there's a YouTube link, add it after the main sentence but before hashtags
-    if song.get("youtube_url"):
-        text += f"\n▶️ Watch/listen: {song['youtube_url']}"
+    # No YouTube URL fallback needed - we only post with images now
 
     link = f"https://pophits.org/songs/{song['slug']}"
     hashtags = generate_hashtags(song)
-    domain = "pophits.org"
-
-    if len(text) + len(f" Check it out at {domain}!\n{hashtags}") <= 300:
-        return f"{text} Check it out at {domain}!\n{hashtags}"
+    if len(text) + len(f" Check it out at {link}!\n{hashtags}") <= 300:
+        return f"{text} Check it out at {link}!\n{hashtags}"
     else:
         return text
 
-def get_youtube_song_url(title, artist, api_key):
-    """Return a YouTube URL for the most likely official song video, or None if not found or API errored."""
-    try:
-        query = f'{artist} {title} official audio OR music video'
-        url = "https://www.googleapis.com/youtube/v3/search"
-        params = {
-            'part': 'snippet',
-            'q': query,
-            'type': 'video',
-            'key': api_key,
-            'maxResults': 5,
-            'videoCategoryId': '10',  # Music
-        }
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        results = data.get('items', [])
-        for item in results:
-            vid_title = item['snippet']['title'].lower()
-            channel = item['snippet']['channelTitle'].lower()
-            # Best: both song and artist in video title
-            if artist.lower() in vid_title and title.lower() in vid_title:
-                return f"https://www.youtube.com/watch?v={item['id']['videoId']}"
-            # Strong: artist in channel name and song in title
-            if artist.lower() in channel and title.lower() in vid_title:
-                return f"https://www.youtube.com/watch?v={item['id']['videoId']}"
-        if results:
-            # Fallback to first result
-            return f"https://www.youtube.com/watch?v={results[0]['id']['videoId']}"
-        return None
-    except Exception as e:
-        print(f"Error fetching YouTube video: {e}")
-        return None
-
 def get_random_song():
-    """Fetch a random song from PopHits API; get cover art or, as fallback, a YouTube video link."""
+    """Fetch a random song from PopHits API; only return if cover art is available."""
     def get_musicbrainz_release_id(artist, track):
         base_url = "https://musicbrainz.org/ws/2/release/"
         query = f'recording:"{track}" AND artist:"{artist}" AND primarytype:single'
@@ -218,9 +180,10 @@ def get_random_song():
         if mbid:
             cover_art_url = get_cover_art_url(mbid)
 
-        youtube_url = None
-        if not cover_art_url and YOUTUBE_API_KEY:
-            youtube_url = get_youtube_song_url(song_title, artist_name, YOUTUBE_API_KEY)
+        # Only return song if cover art is available
+        if not cover_art_url:
+            print(f"⚠️ No cover art found for '{song_title}' by {artist_name}. Skipping post.")
+            return None
 
         song = {
             "title": song_title,
@@ -230,7 +193,6 @@ def get_random_song():
             "weeks_on_chart": weeks_on_chart,
             "slug": slug,
             "cover_art_url": cover_art_url,
-            "youtube_url": youtube_url,
         }
         return song
     except requests.exceptions.RequestException as e:
@@ -253,14 +215,18 @@ def create_bluesky_post(username, password, song, post_text, url, client=None, d
 
         # Facet generation:
         facets = []
-        domain = "pophits.org"
-        url_start = post_text.find(domain)
+        
+        # Find the FULL URL in the post text, not just the domain
+        full_url = f"https://pophits.org/songs/{song['slug']}"
+        url_start = post_text.find(full_url)
+        
         if url_start != -1:
+            url_end = url_start + len(full_url)
             byte_start = len(post_text[:url_start].encode('utf-8'))
-            byte_end = byte_start + len(domain.encode('utf-8'))
+            byte_end = len(post_text[:url_end].encode('utf-8'))
             facets.append(
                 atproto_models.AppBskyRichtextFacet.Main(
-                    features=[atproto_models.AppBskyRichtextFacet.Link(uri=url)],
+                    features=[atproto_models.AppBskyRichtextFacet.Link(uri=full_url)],
                     index=atproto_models.AppBskyRichtextFacet.ByteSlice(byteStart=byte_start, byteEnd=byte_end),
                 )
             )
@@ -280,7 +246,8 @@ def create_bluesky_post(username, password, song, post_text, url, client=None, d
                     ),
                 )
             )
-        
+
+        # Rest of your code remains the same...
         if song.get('cover_art_url'):
             image_url = song['cover_art_url']
             image_response = requests.get(image_url, stream=True)
@@ -303,7 +270,8 @@ def create_bluesky_post(username, password, song, post_text, url, client=None, d
                 facets=facets,
             )
         else:
-            client.post(text=post_text, facets=facets)
+            print("⚠️ Warning: Attempted to post without cover art - this shouldn't happen!")
+            return
 
         print("✅ Bluesky post created successfully!")
     except Exception as e:
@@ -331,6 +299,8 @@ def main():
             client = Client()
             client.login(username, password)
             create_bluesky_post(username, password, song, post_text, url, client, dry_run=False)
+    else:
+        print("🚫 No song with cover art found. No post will be made.")
 
 if __name__ == "__main__":
     main()
